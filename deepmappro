@@ -1,0 +1,2022 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+DeepNetMapper Pro - Kali Linux Modüler Ağ Keşif, Servis Analizi ve Güvenlik Denetim Aracı
+Mimari:
+  - core/: ScopeValidator, ToolManager, ProcessManager, ResultStore, ReportEngine
+  - modules/: DiscoveryModule, NmapScannerModule, DnsAuditModule, WebAuditModule, TlsAuditModule, VulnerabilityAuditModule
+  - Çıktılar: JSON, HTML (XSS Korumalı), TXT, CSV, findings.json, asset_inventory.json, manifest.json, raw/ ve logs/
+"""
+
+import os
+import re
+import csv
+import sys
+import ssl
+import time
+import json
+import html
+import shutil
+import socket
+import signal
+import logging
+import argparse
+import ipaddress
+import subprocess
+import urllib.request
+import urllib.error
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Any
+
+
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+
+
+# =====================================================================
+# 1. CORE: KAPSAM VE HEDEF DOĞRULAMA (core/scope.py)
+# =====================================================================
+class ScopeValidator:
+    """Hedef IP, CIDR, IP aralığı ve alan adı doğrulamasını ve kapsam onayını yönetir."""
+
+    DOMAIN_REGEX = re.compile(
+        r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.[A-Za-z0-9-]{1,63})+$"
+    )
+    IPV4_RANGE_REGEX = re.compile(
+        r"^(\d{1,3}\.\d{1,3}\.\d{1,3}\.)(\d{1,3})-(\d{1,3})$"
+    )
+    FORBIDDEN_CHARS = set(";&|`$><\n\r\\'\"")
+
+    @classmethod
+    def validate_target(cls, target: str) -> Tuple[bool, str, str]:
+        """
+        Hedefi doğrular.
+        Dönüş: (geçerli_mi, hedef_tipi, açıklama_veya_hata)
+        hedef_tipi: 'ip', 'cidr', 'ip_range', 'domain', 'invalid'
+        """
+        if not target or not target.strip():
+            return False, "invalid", "Hedef boş olamaz."
+
+        target = target.strip()
+
+        if target.startswith("-"):
+            return False, "invalid", "Güvenlik engeli: Hedef '-' (parametre bayrağı) ile başlayamaz."
+
+        if any(c in cls.FORBIDDEN_CHARS for c in target):
+            return False, "invalid", "Güvenlik engeli: Hedefte geçersiz kabuk (shell) karakterleri tespit edildi."
+
+        # 1. Tekil IP kontrolü
+        try:
+            ip_obj = ipaddress.ip_address(target)
+            if ip_obj.is_loopback:
+                return True, "ip", f"Loopback IP ({ip_obj})"
+            return True, "ip", f"Tekil IP ({ip_obj})"
+        except ValueError:
+            pass
+
+        # 2. CIDR kontrolü
+        if "/" in target:
+            try:
+                net_obj = ipaddress.ip_network(target, strict=False)
+                if net_obj.num_addresses > 65536:
+                    return False, "invalid", f"CIDR bloğu çok geniş ({net_obj.num_addresses} adres). Maksimum /16 desteklenir."
+                return True, "cidr", f"Alt Ağ / CIDR ({net_obj}, {net_obj.num_addresses} adres)"
+            except ValueError:
+                return False, "invalid", f"Geçersiz CIDR formatı: {target}"
+
+        # 3. Kısa IPv4 aralığı kontrolü (örn: 192.168.1.1-50)
+        range_match = cls.IPV4_RANGE_REGEX.match(target)
+        if range_match:
+            prefix, start_s, end_s = range_match.groups()
+            start_i, end_i = int(start_s), int(end_s)
+            try:
+                ipaddress.IPv4Address(prefix + str(start_i))
+                if 0 <= start_i <= end_i <= 255:
+                    return True, "ip_range", f"IPv4 Aralığı ({start_i}-{end_i})"
+            except ValueError:
+                pass
+            return False, "invalid", f"Geçersiz IP aralığı: {target}"
+
+        # 4. Alan adı (Domain / Hostname) kontrolü
+        if cls.DOMAIN_REGEX.match(target) or target == "localhost":
+            return True, "domain", f"Alan Adı / Hostname ({target})"
+
+        return False, "invalid", f"Tanımlanamayan veya geçersiz hedef formatı: '{target}'"
+
+    @staticmethod
+    def validate_port_spec(port_spec: str) -> bool:
+        """Özel profildeki port aralığı girdisini doğrular (örn: 22,80,443,1000-2000)."""
+        if not port_spec:
+            return False
+        pattern = re.compile(r"^[0-9,\-]+$")
+        if not pattern.match(port_spec):
+            return False
+        for part in port_spec.split(","):
+            if "-" in part:
+                bounds = part.split("-")
+                if len(bounds) != 2 or not bounds[0].isdigit() or not bounds[1].isdigit():
+                    return False
+                low, high = int(bounds[0]), int(bounds[1])
+                if not (1 <= low <= high <= 65535):
+                    return False
+            else:
+                if not part.isdigit() or not (1 <= int(part) <= 65535):
+                    return False
+        return True
+
+
+# =====================================================================
+# 2. CORE: KALI LINUX ARAÇ YÖNETİCİSİ (core/tool_manager.py)
+# =====================================================================
+class ToolManager:
+    """Kali araçlarının kurulu olup olmadığını, sürümlerini ve parametre uyumluluğunu denetler."""
+
+    TOOL_DEFINITIONS = {
+        "nmap": {"required": True, "version_args": ["nmap", "--version"], "desc": "Canlı cihaz, port, servis ve OS keşfi"},
+        "ip": {"required": True, "version_args": ["ip", "-V"], "desc": "Yerel arayüzler ve yönlendirme bilgileri"},
+        "arp-scan": {"required": False, "version_args": ["arp-scan", "--version"], "desc": "Katman-2 yerel Ethernet cihaz keşfi"},
+        "nmcli": {"required": False, "version_args": ["nmcli", "--version"], "desc": "Kablosuz ağ ve arayüz bilgisi"},
+        "dig": {"required": False, "version_args": ["dig", "-v"], "desc": "DNS kayıtlarının incelenmesi"},
+        "host": {"required": False, "version_args": ["host", "-V"], "desc": "Hızlı DNS/PTR sorguları"},
+        "curl": {"required": False, "version_args": ["curl", "--version"], "desc": "HTTP başlıkları ve erişilebilirlik kontrolleri"},
+        "testssl.sh": {"required": False, "alt_names": ["testssl"], "version_args": ["--version"], "desc": "TLS yapılandırması ve sertifika denetimi"},
+        "whatweb": {"required": False, "version_args": ["whatweb", "--version"], "desc": "Web teknolojilerinin tanımlanması"},
+        "nikto": {"required": False, "version_args": ["nikto", "-Version"], "desc": "Web sunucusu yapılandırma denetimleri"},
+        "gvm-cli": {"required": False, "alt_names": ["omp"], "version_args": ["--version"], "desc": "Greenbone/OpenVAS zafiyet tarama entegrasyonu"}
+    }
+
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self.inventory: Dict[str, Dict[str, Any]] = {}
+
+    def check_all_tools(self) -> Dict[str, Dict[str, Any]]:
+        """Tüm araçların varlığını ve sürüm bilgilerini kontrol eder."""
+        for name, meta in self.TOOL_DEFINITIONS.items():
+            binary_path = shutil.which(name)
+            resolved_name = name
+            if not binary_path and "alt_names" in meta:
+                for alt in meta["alt_names"]:
+                    binary_path = shutil.which(alt)
+                    if binary_path:
+                        resolved_name = alt
+                        break
+
+            installed = binary_path is not None
+            version_str = "Kurulu Değil"
+            if installed:
+                version_str = self._extract_version(resolved_name, meta.get("version_args", [resolved_name, "--version"]))
+
+            self.inventory[name] = {
+                "name": name,
+                "resolved_binary": resolved_name if installed else None,
+                "path": binary_path,
+                "installed": installed,
+                "required": meta["required"],
+                "version": version_str,
+                "description": meta["desc"]
+            }
+            if not installed and meta["required"]:
+                self.logger.error(f"Zorunlu araç eksik: {name}")
+            elif not installed:
+                self.logger.info(f"İsteğe bağlı araç kurulu değil: {name}")
+
+        return self.inventory
+
+    def _extract_version(self, binary: str, args: List[str]) -> str:
+        cmd = [binary] + args[1:] if args and args[0] != binary else args
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=4)
+            output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            for line in output.splitlines():
+                clean = line.strip()
+                if clean:
+                    return clean[:80]
+        except Exception as exc:
+            self.logger.debug(f"{binary} sürüm bilgisi alınamadı: {exc}")
+        return "Sürüm Belirlenemedi"
+
+    def is_available(self, tool_name: str) -> bool:
+        return bool(self.inventory.get(tool_name, {}).get("installed"))
+
+    def get_binary(self, tool_name: str) -> str:
+        info = self.inventory.get(tool_name, {})
+        return info.get("resolved_binary") or tool_name
+
+    @staticmethod
+    def resolve_nmap_flags(profile_flags: List[str], speed_flags: List[str], is_root: bool = True) -> List[str]:
+        """
+        Nmap profil ve hız bayraklarını birleştirirken çakışmaları önler.
+        Örn: -sn ile port tarama bayrakları (-sS, -sV, -O, -p-) bir arada kullanılamaz.
+        """
+        combined = list(profile_flags)
+        is_ping_only = "-sn" in combined
+
+        if is_ping_only:
+            forbidden_with_sn = {"-sS", "-sT", "-sU", "-sV", "-O", "-sC", "-p-", "-f"}
+            cleaned = []
+            skip_next = False
+            for idx, flag in enumerate(combined):
+                if skip_next:
+                    skip_next = False
+                    continue
+                if flag in forbidden_with_sn or flag.startswith("--script"):
+                    continue
+                if flag in {"--top-ports", "-p", "--data-length"}:
+                    skip_next = True
+                    continue
+                cleaned.append(flag)
+            combined = cleaned
+
+        if not is_root:
+            combined = ["-sT" if f == "-sS" else f for f in combined if f != "-O"]
+
+        # Zamanlama bayrağı (-T0 .. -T5) tekilleştirme: Hız profilindeki değer önceliklidir
+        speed_timing = [f for f in speed_flags if re.match(r"^-T[0-5]$", f)]
+        if speed_timing:
+            combined = [f for f in combined if not re.match(r"^-T[0-5]$", f)]
+
+        for s_flag in speed_flags:
+            if s_flag not in combined:
+                combined.append(s_flag)
+
+        return combined
+
+
+# =====================================================================
+# 3. CORE: MERKEZİ VERİ DEPOSU VE KORELASYON (core/result_store.py)
+# =====================================================================
+class ResultStore:
+    """
+    Tüm modüllerin bulgularını, varlık envanterini, görev durumlarını ve
+    hataları merkezi olarak tekilleştirerek (deduplication) saklar.
+    """
+
+    def __init__(self, base_scans_dir: str, target: str, profile_name: str, speed_name: str):
+        self.start_time = datetime.now()
+        self.end_time: Optional[datetime] = None
+        self.timestamp = self.start_time.strftime("%Y%m%d_%H%M%S")
+        safe_target = re.sub(r"[^A-Za-z0-9_.-]", "_", target)[:30]
+        self.scan_id = f"{self.timestamp}_{safe_target}"
+        self.scan_dir = os.path.join(base_scans_dir, self.scan_id)
+
+        # Alt klasör yapısı
+        self.logs_dir = os.path.join(self.scan_dir, "logs")
+        self.raw_dirs = {
+            "nmap": os.path.join(self.scan_dir, "raw", "nmap"),
+            "dns": os.path.join(self.scan_dir, "raw", "dns"),
+            "web": os.path.join(self.scan_dir, "raw", "web"),
+            "tls": os.path.join(self.scan_dir, "raw", "tls"),
+        }
+        self._init_directories()
+
+        self.target = target
+        self.profile_name = profile_name
+        self.speed_name = speed_name
+        self.status = "BAŞLATILDI"
+        self.active_tests_authorized = False
+
+        # Veri yapıları
+        self.assets: Dict[str, Dict[str, Any]] = {}
+        self.findings: List[Dict[str, Any]] = []
+        self.tasks: List[Dict[str, Any]] = []
+        self.errors: List[Dict[str, Any]] = []
+        self.environment_info: Dict[str, Any] = {
+            "interfaces": [],
+            "routes": [],
+            "wifi_networks": [],
+            "tools": {}
+        }
+
+    def _init_directories(self):
+        os.makedirs(self.logs_dir, exist_ok=True)
+        for d in self.raw_dirs.values():
+            os.makedirs(d, exist_ok=True)
+
+    def rel_path(self, abs_path: str) -> str:
+        try:
+            return os.path.relpath(abs_path, self.scan_dir)
+        except ValueError:
+            return abs_path
+
+    def ensure_asset(self, ip: str) -> Dict[str, Any]:
+        if ip not in self.assets:
+            self.assets[ip] = {
+                "ip": ip,
+                "hostname": "Bilinmiyor",
+                "hostnames": [],
+                "status": "up",
+                "mac": "Bilinmiyor",
+                "vendor": "Bilinmiyor",
+                "discovery_sources": [],
+                "os_matches": [],
+                "ports": [],
+                "scripts": [],
+                "dns_records": {},
+                "web_services": [],
+                "tls_info": [],
+                "traceroute": [],
+                "scan_completed": False,
+                "partial_recovery": False
+            }
+        return self.assets[ip]
+
+    def upsert_asset(
+        self,
+        ip: str,
+        hostname: Optional[str] = None,
+        mac: Optional[str] = None,
+        vendor: Optional[str] = None,
+        source: Optional[str] = None
+    ):
+        """Aynı IP farklı araçlarla bulunduğunda bilgileri tek varlık altında birleştirir."""
+        asset = self.ensure_asset(ip)
+        if hostname and hostname != "Bilinmiyor":
+            if asset["hostname"] == "Bilinmiyor":
+                asset["hostname"] = hostname
+            if hostname not in asset["hostnames"]:
+                asset["hostnames"].append(hostname)
+        if mac and mac != "Bilinmiyor":
+            asset["mac"] = mac.upper()
+        if vendor and vendor != "Bilinmiyor":
+            asset["vendor"] = vendor
+        if source and source not in asset["discovery_sources"]:
+            asset["discovery_sources"].append(source)
+
+    def upsert_port(
+        self,
+        ip: str,
+        port: int,
+        protocol: str = "tcp",
+        state: str = "open",
+        service: str = "bilinmiyor",
+        product: str = "",
+        version: str = "",
+        extrainfo: str = "",
+        source: str = "nmap",
+        evidence: str = ""
+    ):
+        """Aynı IP/port/protokol kaydını tekilleştirir; yeni servis/kanıt bilgilerini mevcut kayda ekler."""
+        asset = self.ensure_asset(ip)
+        port_num = int(port)
+        proto = protocol.lower()
+
+        existing = None
+        for p in asset["ports"]:
+            if int(p["port"]) == port_num and p["protocol"].lower() == proto:
+                existing = p
+                break
+
+        if existing is None:
+            new_entry = {
+                "port": port_num,
+                "protocol": proto,
+                "state": state,
+                "service": service or "bilinmiyor",
+                "product": product or "",
+                "version": version or "",
+                "extrainfo": extrainfo or "",
+                "sources": [source] if source else [],
+                "evidence": [evidence] if evidence else []
+            }
+            asset["ports"].append(new_entry)
+            asset["ports"].sort(key=lambda x: (x["port"], x["protocol"]))
+        else:
+            if state and existing["state"] in ("bilinmiyor", "unknown"):
+                existing["state"] = state
+            if service and service != "bilinmiyor" and existing["service"] == "bilinmiyor":
+                existing["service"] = service
+            if product and not existing["product"]:
+                existing["product"] = product
+            if version and not existing["version"]:
+                existing["version"] = version
+            if extrainfo and not existing["extrainfo"]:
+                existing["extrainfo"] = extrainfo
+            if source and source not in existing["sources"]:
+                existing["sources"].append(source)
+            if evidence and evidence not in existing["evidence"]:
+                existing["evidence"].append(evidence)
+
+    def add_finding(
+        self,
+        asset_ip: str,
+        title: str,
+        severity: str,
+        category: str,
+        evidence: str,
+        remediation: str,
+        port: Optional[int] = None,
+        tool: str = "nmap"
+    ):
+        """Güvenlik ve yapılandırma bulgularını tekilleştirerek ekler."""
+        severity = severity.upper()
+        if severity not in {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"}:
+            severity = "INFO"
+
+        for f in self.findings:
+            if (
+                f["asset_ip"] == asset_ip
+                and f["port"] == port
+                and f["title"] == title
+                and f["category"] == category
+            ):
+                if evidence and evidence not in f["evidence"]:
+                    f["evidence"] += f"\n---\n{evidence}"
+                return
+
+        self.findings.append({
+            "id": f"FND-{len(self.findings) + 1:04d}",
+            "asset_ip": asset_ip,
+            "port": port,
+            "title": title,
+            "severity": severity,
+            "category": category,
+            "tool": tool,
+            "evidence": evidence.strip() if evidence else "Kanıt metni yok",
+            "remediation": remediation,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+
+    def record_task(
+        self,
+        module: str,
+        tool: str,
+        command: List[str],
+        status: str,
+        returncode: Optional[int],
+        duration_sec: float,
+        raw_output_path: Optional[str] = None,
+        error_msg: str = ""
+    ):
+        self.tasks.append({
+            "module": module,
+            "tool": tool,
+            "command": " ".join(command),
+            "status": status,  # COMPLETED, FAILED, TIMEOUT, INTERRUPTED, SKIPPED
+            "returncode": returncode,
+            "duration_sec": round(duration_sec, 2),
+            "raw_file": self.rel_path(raw_output_path) if raw_output_path else None,
+            "error": error_msg,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+
+    def record_error(self, module: str, message: str, exception_text: str = ""):
+        self.errors.append({
+            "module": module,
+            "message": message,
+            "exception": exception_text,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+
+
+# =====================================================================
+# 4. CORE: SÜREÇ YÖNETİCİSİ (core/process_manager.py)
+# =====================================================================
+class ProcessManager:
+    """
+    Alt süreçleri güvenli argüman dizileriyle çalıştırır, zaman aşımı ve Ctrl+C
+    kesintilerini yönetir, ham çıktıları raw/ dizinine yazar.
+    """
+
+    def __init__(self, store: ResultStore, logger: logging.Logger):
+        self.store = store
+        self.logger = logger
+        self.current_process: Optional[subprocess.Popen] = None
+        self.is_interrupted = False
+
+    def terminate_active_process(self):
+        """Aktif alt süreci güvenli biçimde sonlandırır ve dosya tamponlarının yazılmasını bekler."""
+        proc = self.current_process
+        if proc and proc.poll() is None:
+            self.logger.warning(f"Aktif alt süreç sonlandırılıyor (PID: {proc.pid})...")
+            try:
+                proc.terminate()
+                proc.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                self.logger.warning(f"PID {proc.pid} terminate süresinde kapanmadı, kill gönderiliyor.")
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception as exc:
+                    self.logger.error(f"Süreç sonlandırma hatası: {exc}")
+            except Exception as exc:
+                self.logger.error(f"Süreç durdurulurken hata: {exc}")
+        time.sleep(0.25)
+
+    def run_command(
+        self,
+        module_name: str,
+        tool_name: str,
+        cmd: List[str],
+        timeout: int = 120,
+        raw_category: Optional[str] = None,
+        raw_filename: Optional[str] = None,
+        stream_output: bool = False
+    ) -> Tuple[str, str, int, str]:
+        """
+        Komutu çalıştırır ve (stdout, stderr, returncode, status) döndürür.
+        status: COMPLETED | FAILED | TIMEOUT | INTERRUPTED
+        """
+        if self.is_interrupted:
+            return "", "", -1, "INTERRUPTED"
+
+        start_t = time.time()
+        raw_path = None
+        if raw_category and raw_filename and raw_category in self.store.raw_dirs:
+            raw_path = os.path.join(self.store.raw_dirs[raw_category], raw_filename)
+
+        self.logger.info(f"[{module_name}] Komut başlatılıyor: {' '.join(cmd)}")
+        stdout_lines: List[str] = []
+        stderr_data = ""
+        returncode = -1
+        status = "FAILED"
+
+        try:
+            if stream_output:
+                self.current_process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1
+                )
+                if self.current_process.stdout:
+                    for line in self.current_process.stdout:
+                        stdout_lines.append(line)
+                        line_str = line.strip()
+                        if any(k in line_str for k in ("Stats:", "Timing:", "Discovered open port", "Completed")):
+                            print(f"    {Colors.CYAN}↳ {line_str}{Colors.ENDC}")
+                        if time.time() - start_t > timeout:
+                            self.terminate_active_process()
+                            status = "TIMEOUT"
+                            break
+                        if self.is_interrupted:
+                            status = "INTERRUPTED"
+                            break
+
+                self.current_process.wait(timeout=5)
+                returncode = self.current_process.returncode if self.current_process.returncode is not None else -1
+                stdout_data = "".join(stdout_lines)
+                if status not in ("TIMEOUT", "INTERRUPTED"):
+                    status = "COMPLETED" if returncode == 0 else "FAILED"
+            else:
+                self.current_process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                stdout_data, stderr_data = self.current_process.communicate(timeout=timeout)
+                returncode = self.current_process.returncode
+                if self.is_interrupted:
+                    status = "INTERRUPTED"
+                else:
+                    status = "COMPLETED" if returncode == 0 else "FAILED"
+
+        except subprocess.TimeoutExpired:
+            self.terminate_active_process()
+            stdout_data = "".join(stdout_lines)
+            status = "TIMEOUT"
+            self.store.record_error(module_name, f"{tool_name} zaman aşımına uğradı ({timeout}s)")
+            self.logger.warning(f"[{module_name}] Zaman aşımı ({timeout}s): {' '.join(cmd)}")
+        except Exception as exc:
+            stdout_data = "".join(stdout_lines)
+            stderr_data = str(exc)
+            status = "FAILED"
+            self.store.record_error(module_name, f"{tool_name} çalıştırma hatası", str(exc))
+            self.logger.error(f"[{module_name}] Çalıştırma hatası: {exc}")
+        finally:
+            self.current_process = None
+
+        duration = time.time() - start_t
+
+        if raw_path:
+            try:
+                with open(raw_path, "w", encoding="utf-8", errors="replace") as rf:
+                    rf.write(f"# Command: {' '.join(cmd)}\n")
+                    rf.write(f"# Status: {status} | ReturnCode: {returncode} | Duration: {duration:.2f}s\n\n")
+                    rf.write(stdout_data or "")
+                    if stderr_data:
+                        rf.write("\n--- STDERR ---\n" + stderr_data)
+            except Exception as exc:
+                self.logger.error(f"Ham çıktı dosyası yazılamadı ({raw_path}): {exc}")
+
+        self.store.record_task(
+            module=module_name,
+            tool=tool_name,
+            command=cmd,
+            status=status,
+            returncode=returncode,
+            duration_sec=duration,
+            raw_output_path=raw_path,
+            error_msg=stderr_data.strip()[:300] if status != "COMPLETED" else ""
+        )
+
+        return stdout_data, stderr_data, returncode, status
+
+
+# =====================================================================
+# 5. MODÜLLER: KEŞİF, NMAP, DNS, WEB, TLS, ZAFİYET (modules/*.py)
+# =====================================================================
+class DiscoveryModule:
+    """Yerel ağ arayüzlerini, yönlendirme tablosunu, Wi-Fi ortamını ve ARP/Ping keşfini yönetir."""
+
+    def __init__(self, store: ResultStore, proc_mgr: ProcessManager, tool_mgr: ToolManager, logger: logging.Logger):
+        self.store = store
+        self.proc_mgr = proc_mgr
+        self.tool_mgr = tool_mgr
+        self.logger = logger
+
+    def inspect_local_environment(self) -> List[Dict[str, str]]:
+        """Yerel arayüzleri (ip addr), yönlendirmeleri (ip route) ve Wi-Fi ağlarını (nmcli) toplar."""
+        discovered_subnets: List[Dict[str, str]] = []
+
+        # 1. ip -o -4 addr show
+        if self.tool_mgr.is_available("ip"):
+            out, _, rc, _ = self.proc_mgr.run_command(
+                "discovery", "ip", ["ip", "-o", "-4", "addr", "show"], timeout=10
+            )
+            if rc == 0:
+                for line in out.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        iface = parts[1]
+                        cidr = parts[3]
+                        if iface != "lo" and "/" in cidr:
+                            try:
+                                net = str(ipaddress.ip_network(cidr, strict=False))
+                            except ValueError:
+                                net = cidr
+                            entry = {"type": "Yerel Alt Ağ (Interface)", "name": iface, "target": net, "ip_cidr": cidr}
+                            self.store.environment_info["interfaces"].append(entry)
+                            discovered_subnets.append(entry)
+
+            # 2. ip route
+            r_out, _, r_rc, _ = self.proc_mgr.run_command(
+                "discovery", "ip", ["ip", "route", "show"], timeout=10
+            )
+            if r_rc == 0:
+                self.store.environment_info["routes"] = [
+                    line.strip() for line in r_out.splitlines() if line.strip()
+                ]
+
+        # 3. nmcli Wi-Fi keşfi (Kaçışlı '\:' karakterlerini bozmadan ayrıştırır)
+        if self.tool_mgr.is_available("nmcli"):
+            w_out, _, w_rc, _ = self.proc_mgr.run_command(
+                "discovery",
+                "nmcli",
+                ["nmcli", "-t", "-e", "yes", "-f", "ACTIVE,SSID,BSSID,CHAN,SIGNAL", "dev", "wifi"],
+                timeout=8
+            )
+            if w_rc == 0:
+                for line in w_out.splitlines():
+                    if not line.strip():
+                        continue
+                    fields = [f.replace("\\:", ":").replace("\\\\", "\\") for f in re.split(r"(?<!\\):", line)]
+                    if len(fields) >= 5:
+                        active, ssid, bssid, chan, signal_lvl = fields[:5]
+                        ssid_clean = ssid.strip() or "<Gizli SSID>"
+                        self.store.environment_info["wifi_networks"].append({
+                            "active": active,
+                            "ssid": ssid_clean,
+                            "bssid": bssid,
+                            "channel": chan,
+                            "signal": signal_lvl
+                        })
+
+        return discovered_subnets
+
+    def run_arp_scan(self, target: str):
+        """Yerel alt ağ hedeflerinde arp-scan ile Katman-2 keşfi yapar."""
+        if not self.tool_mgr.is_available("arp-scan"):
+            self.store.record_task("discovery", "arp-scan", ["arp-scan"], "SKIPPED", None, 0.0, error_msg="arp-scan kurulu değil")
+            return
+
+        valid, t_type, _ = ScopeValidator.validate_target(target)
+        if not valid or t_type not in ("cidr", "ip_range"):
+            return
+
+        print(f"{Colors.BLUE}[*] Katman-2 ARP Öncül Keşfi çalıştırılıyor (arp-scan)...{Colors.ENDC}")
+        out, _, _, _ = self.proc_mgr.run_command(
+            module_name="discovery",
+            tool_name="arp-scan",
+            cmd=[self.tool_mgr.get_binary("arp-scan"), target],
+            timeout=30,
+            raw_category="nmap",
+            raw_filename="arp_scan_raw.txt"
+        )
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                ip_candidate = parts[0].strip()
+                mac_candidate = parts[1].strip()
+                vendor = parts[2].strip() if len(parts) > 2 else "Bilinmiyor"
+                is_ip, _, _ = ScopeValidator.validate_target(ip_candidate)
+                if is_ip:
+                    self.store.upsert_asset(
+                        ip=ip_candidate,
+                        mac=mac_candidate,
+                        vendor=vendor,
+                        source="arp-scan"
+                    )
+
+
+class NmapScannerModule:
+    """Nmap keşif, derin port/servis taraması, XML ayrıştırma ve Ctrl+C kısmi veri kurtarma modülü."""
+
+    def __init__(self, store: ResultStore, proc_mgr: ProcessManager, tool_mgr: ToolManager, logger: logging.Logger):
+        self.store = store
+        self.proc_mgr = proc_mgr
+        self.tool_mgr = tool_mgr
+        self.logger = logger
+        self.xml_files: List[str] = []
+
+    def discover_live_hosts(self, target: str) -> List[str]:
+        """Aşama 1: Nmap Ping/ARP/ICMP keşfi ile canlı cihazları belirler."""
+        xml_path = os.path.join(self.store.raw_dirs["nmap"], "01_host_discovery.xml")
+        self.xml_files.append(xml_path)
+
+        cmd = ["nmap", "-sn", "-PE", "-PP", "-PM", "-T4", "-oX", xml_path, target]
+        print(f"{Colors.BLUE}[*] Nmap Canlı Cihaz Keşfi: {' '.join(cmd)}{Colors.ENDC}")
+
+        self.proc_mgr.run_command(
+            module_name="nmap_discovery",
+            tool_name="nmap",
+            cmd=cmd,
+            timeout=180,
+            raw_category="nmap",
+            raw_filename="01_host_discovery_stdout.txt"
+        )
+
+        self.parse_and_recover_xml(xml_path, source_tag="nmap-discovery")
+        return list(self.store.assets.keys())
+
+    def scan_hosts(self, live_ips: List[str], profile_flags: List[str], speed_flags: List[str], host_timeout_sec: int = 600):
+        """Aşama 2: Aktif cihazları seçilen profil ve hız bayraklarıyla tarar."""
+        is_root = (os.geteuid() == 0) if hasattr(os, "geteuid") else False
+        effective_flags = self.tool_mgr.resolve_nmap_flags(profile_flags, speed_flags, is_root=is_root)
+
+        # Profil 1 (-sn) ise yalnızca topoloji / traceroute tamamlanır
+        if "-sn" in effective_flags:
+            print(f"\n{Colors.CYAN}[*] Hızlı Keşif profili (-sn): Port taraması yapılmadan topoloji haritalanıyor...{Colors.ENDC}")
+            topo_xml = os.path.join(self.store.raw_dirs["nmap"], "02_topology_only.xml")
+            self.xml_files.append(topo_xml)
+            cmd = ["nmap"] + effective_flags + ["-oX", topo_xml] + live_ips
+            self.proc_mgr.run_command(
+                module_name="nmap_topology",
+                tool_name="nmap",
+                cmd=cmd,
+                timeout=host_timeout_sec,
+                raw_category="nmap",
+                raw_filename="02_topology_stdout.txt"
+            )
+            self.parse_and_recover_xml(topo_xml, source_tag="nmap-topology")
+            for ip in live_ips:
+                self.store.ensure_asset(ip)["scan_completed"] = True
+            return
+
+        print(f"\n{Colors.CYAN}{Colors.BOLD}[AŞAMA 2] Derin Servis ve Port Analizi Başlatılıyor...{Colors.ENDC}")
+        print(f"{Colors.WARNING}[i] İpucu: 'Ctrl+C' ile durdurduğunuzda o ana kadar bulunan tüm açık portlar ve XML verileri kurtarılır.{Colors.ENDC}\n")
+
+        total = len(live_ips)
+        for idx, ip in enumerate(live_ips, start=1):
+            if self.proc_mgr.is_interrupted:
+                break
+
+            safe_ip = ip.replace(".", "_").replace(":", "_")
+            host_xml = os.path.join(self.store.raw_dirs["nmap"], f"host_{safe_ip}.xml")
+            self.xml_files.append(host_xml)
+
+            cmd = ["nmap"] + effective_flags + ["--stats-every", "5s", "-oX", host_xml, ip]
+            print(f"{Colors.BOLD}[{idx}/{total}] Hedef Taranıyor: {ip}{Colors.ENDC}")
+            print(f"    Komut: {' '.join(cmd)}")
+
+            _, _, _, status = self.proc_mgr.run_command(
+                module_name="nmap_deep_scan",
+                tool_name="nmap",
+                cmd=cmd,
+                timeout=host_timeout_sec,
+                raw_category="nmap",
+                raw_filename=f"host_{safe_ip}_stdout.txt",
+                stream_output=True
+            )
+
+            self.parse_and_recover_xml(host_xml, source_tag="nmap-deep", expected_ip=ip)
+            asset = self.store.ensure_asset(ip)
+            if status == "COMPLETED":
+                asset["scan_completed"] = True
+            else:
+                asset["partial_recovery"] = True
+
+            print(f"    {Colors.GREEN}[✓] {ip} işlendi ({len(asset['ports'])} açık port kayıtlı, Durum: {status}).{Colors.ENDC}\n")
+
+    def recover_all_pending_xmls(self):
+        """Kesinti (Ctrl+C) sonrasında tüm XML dosyalarını yeniden okuyup kurtarır."""
+        for xml_file in self.xml_files:
+            if os.path.exists(xml_file):
+                self.parse_and_recover_xml(xml_file, source_tag="nmap-interrupted-recovery")
+
+    def parse_and_recover_xml(self, xml_path: str, source_tag: str = "nmap", expected_ip: Optional[str] = None):
+        """
+        Nmap XML çıktısını ayrıştırır.
+        Yarım kalmış (bozuk) XML dosyalarında:
+          1. Tamamlanmış <host>...</host> bloklarını onararak ElementTree ile okur.
+          2. Kapanmamış son <host> bloğundaki açık portları düzenli ifadelerle (fallback) kurtarır.
+        """
+        if not os.path.exists(xml_path) or os.path.getsize(xml_path) == 0:
+            return
+
+        try:
+            with open(xml_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as exc:
+            self.logger.error(f"XML okuma hatası ({xml_path}): {exc}")
+            self.store.record_error("xml_parser", f"XML okunamadı: {xml_path}", str(exc))
+            return
+
+        if not content.strip():
+            return
+
+        trailing_fragment = ""
+        if "</nmaprun>" not in content:
+            self.logger.warning(f"Tamamlanmamış XML tespit edildi, kurtarma uygulanıyor: {os.path.basename(xml_path)}")
+            last_host_end = content.rfind("</host>")
+            if last_host_end != -1:
+                trailing_fragment = content[last_host_end + len("</host>"):]
+                content = content[:last_host_end + len("</host>")] + "\n</nmaprun>"
+            else:
+                trailing_fragment = content
+                content = ""
+
+        if content:
+            try:
+                root = ET.fromstring(content)
+                for host_elem in root.findall("host"):
+                    self._parse_host_element(host_elem, source_tag)
+            except ET.ParseError as exc:
+                self.logger.warning(f"XML ElementTree onarımı başarısız, yedek ayrıştırıcıya geçiliyor: {exc}")
+                trailing_fragment = content + "\n" + trailing_fragment
+
+        if trailing_fragment.strip():
+            self._Fallback_regex_recovery(trailing_fragment, expected_ip, source_tag)
+
+    def _parse_host_element(self, host: ET.Element, source_tag: str):
+        status_elem = host.find("status")
+        if status_elem is not None and status_elem.get("state") not in ("up", None):
+            return
+
+        ip_addr = None
+        mac_addr = None
+        vendor = None
+        for addr in host.findall("address"):
+            atype = addr.get("addrtype")
+            if atype in ("ipv4", "ipv6"):
+                ip_addr = addr.get("addr")
+            elif atype == "mac":
+                mac_addr = addr.get("addr")
+                vendor = addr.get("vendor")
+
+        if not ip_addr:
+            return
+
+        hostname = None
+        hostnames_elem = host.find("hostnames")
+        if hostnames_elem is not None:
+            hn_elem = hostnames_elem.find("hostname")
+            if hn_elem is not None and hn_elem.get("name"):
+                hostname = hn_elem.get("name")
+
+        self.store.upsert_asset(ip=ip_addr, hostname=hostname, mac=mac_addr, vendor=vendor, source=source_tag)
+        asset = self.store.ensure_asset(ip_addr)
+
+        # OS tahminleri
+        os_elem = host.find("os")
+        if os_elem is not None:
+            for osmatch in os_elem.findall("osmatch"):
+                os_name = osmatch.get("name")
+                os_acc = osmatch.get("accuracy", "0")
+                entry = {"name": os_name, "accuracy": os_acc}
+                if os_name and entry not in asset["os_matches"]:
+                    asset["os_matches"].append(entry)
+
+        # Portlar ve port seviyesi NSE scriptleri
+        ports_elem = host.find("ports")
+        if ports_elem is not None:
+            for port in ports_elem.findall("port"):
+                port_id_str = port.get("portid", "0")
+                if not port_id_str.isdigit():
+                    continue
+                port_id = int(port_id_str)
+                protocol = port.get("protocol", "tcp")
+
+                state_elem = port.find("state")
+                state = state_elem.get("state", "bilinmiyor") if state_elem is not None else "bilinmiyor"
+                if state != "open":
+                    continue
+
+                service_elem = port.find("service")
+                service_name = service_elem.get("name", "bilinmiyor") if service_elem is not None else "bilinmiyor"
+                product = service_elem.get("product", "") if service_elem is not None else ""
+                version = service_elem.get("version", "") if service_elem is not None else ""
+                extrainfo = service_elem.get("extrainfo", "") if service_elem is not None else ""
+
+                self.store.upsert_port(
+                    ip=ip_addr,
+                    port=port_id,
+                    protocol=protocol,
+                    state=state,
+                    service=service_name,
+                    product=product,
+                    version=version,
+                    extrainfo=extrainfo,
+                    source=source_tag
+                )
+
+                for scr in port.findall("script"):
+                    s_id = scr.get("id", "unknown-script")
+                    s_out = scr.get("output", "")
+                    scr_record = {"port": port_id, "id": s_id, "output": s_out}
+                    if scr_record not in asset["scripts"]:
+                        asset["scripts"].append(scr_record)
+                    self._correlate_nse_finding(ip_addr, port_id, s_id, s_out)
+
+        # Host seviyesi NSE scriptleri
+        hostscript_elem = host.find("hostscript")
+        if hostscript_elem is not None:
+            for scr in hostscript_elem.findall("script"):
+                s_id = scr.get("id", "host-script")
+                s_out = scr.get("output", "")
+                scr_record = {"port": None, "id": s_id, "output": s_out}
+                if scr_record not in asset["scripts"]:
+                    asset["scripts"].append(scr_record)
+                self._correlate_nse_finding(ip_addr, None, s_id, s_out)
+
+        # Traceroute
+        trace_elem = host.find("trace")
+        if trace_elem is not None:
+            hops = []
+            for hop in trace_elem.findall("hop"):
+                hops.append({
+                    "ttl": hop.get("ttl", ""),
+                    "ip": hop.get("ipaddr", ""),
+                    "host": hop.get("host", ""),
+                    "rtt": hop.get("rtt", "")
+                })
+            if hops:
+                asset["traceroute"] = hops
+
+    def _Fallback_regex_recovery(self, fragment: str, expected_ip: Optional[str], source_tag: str):
+        """Kapanmamış XML parçacığından IP, MAC ve açık portları kurtarır."""
+        ip_match = re.search(r'<address addr="([^"]+)" addrtype="ipv4"', fragment)
+        ip_addr = ip_match.group(1) if ip_match else expected_ip
+        if not ip_addr:
+            return
+
+        mac_match = re.search(r'<address addr="([^"]+)" addrtype="mac"(?: vendor="([^"]*)")?', fragment)
+        mac_addr = mac_match.group(1) if mac_match else None
+        vendor = mac_match.group(2) if (mac_match and mac_match.group(2)) else None
+
+        self.store.upsert_asset(ip=ip_addr, mac=mac_addr, vendor=vendor, source=f"{source_tag}-partial")
+        asset = self.store.ensure_asset(ip_addr)
+        asset["partial_recovery"] = True
+
+        port_pattern = re.compile(
+            r'<port protocol="(tcp|udp)" portid="(\d+)">\s*<state state="open"[^/]*/>'
+            r'(?:\s*<service name="([^"]*)"(?: product="([^"]*)")?(?: version="([^"]*)")?)?',
+            re.DOTALL
+        )
+        for m in port_pattern.finditer(fragment):
+            proto, pid, svc, prod, ver = m.groups()
+            self.store.upsert_port(
+                ip=ip_addr,
+                port=int(pid),
+                protocol=proto,
+                state="open",
+                service=svc or "bilinmiyor",
+                product=prod or "",
+                version=ver or "",
+                source=f"{source_tag}-partial"
+            )
+
+    def _correlate_nse_finding(self, ip: str, port: Optional[int], script_id: str, output: str):
+        """NSE script çıktılarını inceleyerek güvenlik bulgularına dönüştürür."""
+        if not output:
+            return
+        upper_out = output.upper()
+        if "VULNERABLE" in upper_out and "NOT VULNERABLE" not in upper_out:
+            self.store.add_finding(
+                asset_ip=ip,
+                port=port,
+                title=f"NSE Zafiyet Göstergesi: {script_id}",
+                severity="HIGH",
+                category="NSE Vulnerability Check",
+                evidence=output,
+                remediation="İlgili servis sürümünü güncelleyin ve NSE çıktısındaki CVE/yapılandırma detaylarını doğrulayın.",
+                tool="nmap-nse"
+            )
+        elif any(k in script_id for k in ("smb-security-mode", "ftp-anon", "http-title", "ssh2-enum-algos")):
+            if "Anonymous FTP login allowed" in output:
+                self.store.add_finding(
+                    asset_ip=ip,
+                    port=port,
+                    title="Anonim FTP Girişi Aktif",
+                    severity="MEDIUM",
+                    category="Access Control",
+                    evidence=output,
+                    remediation="FTP sunucusunda anonim erişimi devre dışı bırakın veya SFTP/SCP kullanın.",
+                    tool="nmap-nse"
+                )
+            elif "message_signing: disabled" in output.lower():
+                self.store.add_finding(
+                    asset_ip=ip,
+                    port=port,
+                    title="SMB İletişim İmzalama (Signing) Devre Dışı",
+                    severity="MEDIUM",
+                    category="Network Configuration",
+                    evidence=output,
+                    remediation="SMB Relay saldırılarını önlemek için SMB Signing özelliğini zorunlu (required) yapın.",
+                    tool="nmap-nse"
+                )
+
+
+class DnsAuditModule:
+    """dig ve host araçlarını kullanarak PTR ve alan adı DNS kayıtlarını denetler."""
+
+    def __init__(self, store: ResultStore, proc_mgr: ProcessManager, tool_mgr: ToolManager, logger: logging.Logger):
+        self.store = store
+        self.proc_mgr = proc_mgr
+        self.tool_mgr = tool_mgr
+        self.logger = logger
+
+    def run(self, target: str, live_ips: List[str]):
+        print(f"{Colors.CYAN}[*] DNS ve Ters (PTR) Kayıt Analizi Çalıştırılıyor...{Colors.ENDC}")
+
+        # 1. Hedef bir alan adıysa A, MX, NS, TXT kayıtlarını sorgula
+        valid, t_type, _ = ScopeValidator.validate_target(target)
+        if valid and t_type == "domain" and self.tool_mgr.is_available("dig"):
+            for rtype in ("A", "AAAA", "MX", "NS", "TXT"):
+                if self.proc_mgr.is_interrupted:
+                    return
+                out, _, rc, _ = self.proc_mgr.run_command(
+                    module_name="dns_audit",
+                    tool_name="dig",
+                    cmd=["dig", "+short", target, rtype],
+                    timeout=15,
+                    raw_category="dns",
+                    raw_filename=f"dig_{target}_{rtype}.txt"
+                )
+                if rc == 0 and out.strip():
+                    records = [line.strip() for line in out.splitlines() if line.strip()]
+                    for ip in live_ips:
+                        self.store.ensure_asset(ip)["dns_records"][rtype] = records
+
+                    if rtype == "TXT":
+                        has_spf = any("v=spf1" in r.lower() for r in records)
+                        if not has_spf:
+                            self.store.add_finding(
+                                asset_ip=live_ips[0] if live_ips else target,
+                                title=f"Eksik SPF DNS Kaydı ({target})",
+                                severity="LOW",
+                                category="DNS Security",
+                                evidence=f"TXT Kayıtları: {', '.join(records)}",
+                                remediation="E-posta sahteciliğini önlemek için alan adına geçerli bir v=spf1 TXT kaydı ekleyin.",
+                                tool="dig"
+                            )
+
+        # 2. Keşfedilen IP'ler için PTR (Ters DNS) kontrolü
+        for ip in live_ips:
+            if self.proc_mgr.is_interrupted:
+                break
+            asset = self.store.ensure_asset(ip)
+            if self.tool_mgr.is_available("dig"):
+                out, _, rc, _ = self.proc_mgr.run_command(
+                    module_name="dns_audit",
+                    tool_name="dig",
+                    cmd=["dig", "+short", "-x", ip],
+                    timeout=10,
+                    raw_category="dns",
+                    raw_filename=f"ptr_{ip.replace('.', '_')}.txt"
+                )
+                if rc == 0 and out.strip():
+                    ptr_host = out.splitlines()[0].strip().rstrip(".")
+                    self.store.upsert_asset(ip=ip, hostname=ptr_host, source="dig-ptr")
+                    asset["dns_records"]["PTR"] = ptr_host
+            elif self.tool_mgr.is_available("host"):
+                out, _, rc, _ = self.proc_mgr.run_command(
+                    module_name="dns_audit",
+                    tool_name="host",
+                    cmd=["host", ip],
+                    timeout=10,
+                    raw_category="dns",
+                    raw_filename=f"host_ptr_{ip.replace('.', '_')}.txt"
+                )
+                if rc == 0 and "domain name pointer" in out:
+                    ptr_host = out.split("domain name pointer")[-1].strip().rstrip(".")
+                    self.store.upsert_asset(ip=ip, hostname=ptr_host, source="host-ptr")
+                    asset["dns_records"]["PTR"] = ptr_host
+
+
+class WebAuditModule:
+    """Açık HTTP/HTTPS servislerinde başlık denetimi (curl), teknoloji tespiti (whatweb) ve izinliyse nikto çalıştırır."""
+
+    WEB_PORTS = {80, 443, 8080, 8443, 8000, 8008, 8888, 3000, 5000}
+    SECURITY_HEADERS = [
+        ("Strict-Transport-Security", "LOW", "HTTPS bağlantılarında HSTS başlığı tanımlanmamış."),
+        ("X-Frame-Options", "LOW", "Clickjacking koruması için X-Frame-Options (veya CSP frame-ancestors) eksik."),
+        ("X-Content-Type-Options", "LOW", "MIME-sniffing koruması için 'X-Content-Type-Options: nosniff' başlığı eksik."),
+        ("Content-Security-Policy", "INFO", "İçerik Güvenlik Politikası (CSP) başlığı tespit edilmedi.")
+    ]
+
+    def __init__(self, store: ResultStore, proc_mgr: ProcessManager, tool_mgr: ToolManager, logger: logging.Logger):
+        self.store = store
+        self.proc_mgr = proc_mgr
+        self.tool_mgr = tool_mgr
+        self.logger = logger
+
+    def run(self, live_ips: List[str], run_nikto: bool = False):
+        web_targets: List[Tuple[str, int, str]] = []
+        for ip in live_ips:
+            asset = self.store.ensure_asset(ip)
+            for p in asset["ports"]:
+                if p["state"] != "open":
+                    continue
+                port_num = int(p["port"])
+                svc = p["service"].lower()
+                if port_num in self.WEB_PORTS or "http" in svc:
+                    scheme = "https" if (port_num in {443, 8443} or "https" in svc or "ssl" in svc) else "http"
+                    web_targets.append((ip, port_num, scheme))
+
+        if not web_targets:
+            return
+
+        print(f"{Colors.CYAN}[*] Web Servis ve Güvenlik Başlığı Denetimi ({len(web_targets)} uç nokta)...{Colors.ENDC}")
+
+        for ip, port, scheme in web_targets:
+            if self.proc_mgr.is_interrupted:
+                break
+            url = f"{scheme}://{ip}:{port}"
+            safe_tag = f"{ip.replace('.', '_')}_{port}"
+            asset = self.store.ensure_asset(ip)
+
+            # 1. curl ile HTTP Başlık Analizi
+            if self.tool_mgr.is_available("curl"):
+                out, _, rc, _ = self.proc_mgr.run_command(
+                    module_name="web_audit",
+                    tool_name="curl",
+                    cmd=["curl", "-sS", "-I", "-k", "-L", "--max-time", "10", url],
+                    timeout=15,
+                    raw_category="web",
+                    raw_filename=f"curl_headers_{safe_tag}.txt"
+                )
+                if rc == 0 and out.strip():
+                    headers_lower = out.lower()
+                    asset["web_services"].append({
+                        "url": url,
+                        "tool": "curl",
+                        "headers_summary": out.splitlines()[:12]
+                    })
+                    for hdr, sev, msg in self.SECURITY_HEADERS:
+                        if scheme == "http" and hdr == "Strict-Transport-Security":
+                            continue
+                        if hdr.lower() + ":" not in headers_lower:
+                            self.store.add_finding(
+                                asset_ip=ip,
+                                port=port,
+                                title=f"Eksik HTTP Güvenlik Başlığı: {hdr}",
+                                severity=sev,
+                                category="Web Security Headers",
+                                evidence=f"URL: {url}\nAlınan ilk satırlar:\n" + "\n".join(out.splitlines()[:8]),
+                                remediation=f"{msg} Web sunucusu yapılandırmasına '{hdr}' başlığını ekleyin.",
+                                tool="curl"
+                            )
+
+            # 2. whatweb ile kontrollü teknoloji tespiti (--aggression 1: pasif/stealthy)
+            if self.tool_mgr.is_available("whatweb"):
+                w_out, _, w_rc, _ = self.proc_mgr.run_command(
+                    module_name="web_audit",
+                    tool_name="whatweb",
+                    cmd=["whatweb", "--color=never", "-a", "1", url],
+                    timeout=25,
+                    raw_category="web",
+                    raw_filename=f"whatweb_{safe_tag}.txt"
+                )
+                if w_rc == 0 and w_out.strip():
+                    asset["web_services"].append({
+                        "url": url,
+                        "tool": "whatweb",
+                        "fingerprint": w_out.strip()
+                    })
+
+            # 3. nikto (Yalnızca aktif test onayı verilmişse çalışır)
+            if run_nikto and self.store.active_tests_authorized and self.tool_mgr.is_available("nikto"):
+                print(f"    {Colors.WARNING}[*] Yetkilendirilmiş Nikto denetimi çalışıyor: {url}{Colors.ENDC}")
+                n_out, _, _, _ = self.proc_mgr.run_command(
+                    module_name="web_audit",
+                    tool_name="nikto",
+                    cmd=["nikto", "-h", url, "-maxtime", "60s", "-Tuning", "123b", "-nointeractive"],
+                    timeout=75,
+                    raw_category="web",
+                    raw_filename=f"nikto_{safe_tag}.txt"
+                )
+                if n_out:
+                    for line in n_out.splitlines():
+                        if line.startswith("+ ") and any(k in line.lower() for k in ("osvdb", "vulnerable", "outdated", "directory indexing")):
+                            self.store.add_finding(
+                                asset_ip=ip,
+                                port=port,
+                                title="Nikto Web Yapılandırma Bulgusu",
+                                severity="MEDIUM",
+                                category="Web Server Audit",
+                                evidence=line.strip(),
+                                remediation="Nikto çıktısında belirtilen dizin/dosya erişimini kısıtlayın ve sunucu sürümünü güncelleyin.",
+                                tool="nikto"
+                            )
+
+
+class TlsAuditModule:
+    """Açık TLS/SSL portlarında sertifika geçerliliği ve protokol güvenliğini (testssl.sh veya yerleşik SSL) denetler."""
+
+    TLS_PORTS = {443, 8443, 993, 995, 465, 636}
+
+    def __init__(self, store: ResultStore, proc_mgr: ProcessManager, tool_mgr: ToolManager, logger: logging.Logger):
+        self.store = store
+        self.proc_mgr = proc_mgr
+        self.tool_mgr = tool_mgr
+        self.logger = logger
+
+    def run(self, live_ips: List[str]):
+        tls_targets: List[Tuple[str, int]] = []
+        for ip in live_ips:
+            asset = self.store.ensure_asset(ip)
+            for p in asset["ports"]:
+                if p["state"] != "open":
+                    continue
+                port_num = int(p["port"])
+                svc = p["service"].lower()
+                if port_num in self.TLS_PORTS or "ssl" in svc or "https" in svc or "tls" in svc:
+                    tls_targets.append((ip, port_num))
+
+        if not tls_targets:
+            return
+
+        print(f"{Colors.CYAN}[*] TLS / Sertifika Güvenlik Denetimi ({len(tls_targets)} servis)...{Colors.ENDC}")
+
+        for ip, port in tls_targets:
+            if self.proc_mgr.is_interrupted:
+                break
+            asset = self.store.ensure_asset(ip)
+            safe_tag = f"{ip.replace('.', '_')}_{port}"
+
+            # 1. Yerleşik Python SSL ile hızlı protokol ve sertifika kontrolü
+            tls_summary = self._inspect_with_python_ssl(ip, port)
+            if tls_summary:
+                asset["tls_info"].append(tls_summary)
+
+            # 2. testssl.sh kuruluysa kapsamlı kontrol
+            if self.tool_mgr.is_available("testssl.sh"):
+                binary = self.tool_mgr.get_binary("testssl.sh")
+                out, _, _, _ = self.proc_mgr.run_command(
+                    module_name="tls_audit",
+                    tool_name="testssl.sh",
+                    cmd=[binary, "--quiet", "--color", "0", "--protocols", "--server-defaults", f"{ip}:{port}"],
+                    timeout=90,
+                    raw_category="tls",
+                    raw_filename=f"testssl_{safe_tag}.txt"
+                )
+                if out:
+                    for line in out.splitlines():
+                        if any(proto in line for proto in ("SSLv2", "SSLv3", "TLS 1.0", "TLS 1.1")) and "offered" in line.lower() and "not offered" not in line.lower():
+                            self.store.add_finding(
+                                asset_ip=ip,
+                                port=port,
+                                title="Eski/Güvensiz TLS Protokolü Destekleniyor",
+                                severity="MEDIUM",
+                                category="TLS Configuration",
+                                evidence=line.strip(),
+                                remediation="Sunucuda SSLv2, SSLv3, TLS 1.0 ve TLS 1.1 protokollerini devre dışı bırakarak yalnızca TLS 1.2 ve TLS 1.3 kullanın.",
+                                tool="testssl.sh"
+                            )
+
+    def _inspect_with_python_ssl(self, ip: str, port: int) -> Optional[Dict[str, Any]]:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            with socket.create_connection((ip, port), timeout=6) as sock:
+                with ctx.wrap_socket(sock, server_hostname=ip) as ssock:
+                    cipher = ssock.cipher()
+                    tls_ver = ssock.version()
+                    info = {
+                        "port": port,
+                        "protocol_version": tls_ver,
+                        "cipher_suite": cipher[0] if cipher else "Bilinmiyor",
+                        "cipher_bits": cipher[2] if cipher else 0
+                    }
+                    if tls_ver in ("SSLv2", "SSLv3", "TLSv1", "TLSv1.1"):
+                        self.store.add_finding(
+                            asset_ip=ip,
+                            port=port,
+                            title=f"Zayıf TLS Sürümü Müzakere Edildi ({tls_ver})",
+                            severity="MEDIUM",
+                            category="TLS Configuration",
+                            evidence=f"{ip}:{port} bağlantısında {tls_ver} ({info['cipher_suite']}) kullanıldı.",
+                            remediation=" yalnızca TLSv1.2 ve TLSv1.3 protokollerine izin verecek şekilde yapılandırın.",
+                            tool="python-ssl"
+                        )
+                    return info
+        except Exception as exc:
+            self.logger.debug(f"TLS bağlantı kontrolü başarısız ({ip}:{port}): {exc}")
+            return None
+
+
+class VulnerabilityAuditModule:
+    """Açık port/servis korelasyonu ile riskli servisleri tespit eder ve OpenVAS/GVM hazırlığını kontrol eder."""
+
+    RISKY_PORTS = {
+        21: ("FTP Servisi Açık (Şifresiz İletişim Riski)", "LOW", "Dosya transferi için düz metin FTP yerine SFTP veya FTPS tercih edin."),
+        23: ("Telnet Servisi Açık (Düz Metin Kimlik Bilgisi)", "HIGH", "Telnet servisini derhal kapatın ve uzaktan yönetim için yalnızca SSH kullanın."),
+        445: ("SMB Dosya Paylaşım Portu Erişilebilir", "INFO", "SMB servisinin yalnızca yetkili alt ağlardan erişilebilir olduğunu ve güncel yamaların uygulandığını doğrulayın."),
+        3389: ("RDP (Uzak Masaüstü) Servisi Açık", "LOW", "RDP erişimini VPN arkasına alın, NLA (Network Level Authentication) ve güçlü parola politikası uygulayın."),
+        6379: ("Redis Veritabanı Portu Ağdan Erişilebilir", "HIGH", "Redis servisini localhost'a bağlayın (bind 127.0.0.1) ve kimlik doğrulamayı (requirepass/ACL) zorunlu kılın.")
+    }
+
+    def __init__(self, store: ResultStore, tool_mgr: ToolManager, logger: logging.Logger):
+        self.store = store
+        self.tool_mgr = tool_mgr
+        self.logger = logger
+
+    def run(self, live_ips: List[str]):
+        for ip in live_ips:
+            asset = self.store.ensure_asset(ip)
+            for p in asset["ports"]:
+                if p["state"] != "open":
+                    continue
+                port_num = int(p["port"])
+                svc_desc = f"{p['service']} {p['product']} {p['version']}".strip()
+                if port_num in self.RISKY_PORTS:
+                    title, sev, rem = self.RISKY_PORTS[port_num]
+                    self.store.add_finding(
+                        asset_ip=ip,
+                        port=port_num,
+                        title=title,
+                        severity=sev,
+                        category="Exposed Service",
+                        evidence=f"Açık Port: {port_num}/{p['protocol']} | Servis: {svc_desc}",
+                        remediation=rem,
+                        tool="service-correlator"
+                    )
+
+
+# =====================================================================
+# 6. CORE: BİRLEŞİK RAPORLAMA MOTORU (core/report_engine.py)
+# =====================================================================
+class ReportEngine:
+    """
+    Toplanan tüm verileri:
+    - report.json
+    - findings.json
+    - asset_inventory.json
+    - manifest.json
+    - report.txt
+    - report.csv
+    - report.html (XSS korumalı html.escape ile)
+    olarak tek klasöre kaydeder.
+    """
+
+    def __init__(self, store: ResultStore, logger: logging.Logger):
+        self.store = store
+        self.logger = logger
+        self.saved = False
+
+    def save_all(self, final_status: str):
+        if self.saved:
+            return
+        self.saved = True
+        self.store.end_time = datetime.now()
+        self.store.status = final_status
+
+        scan_dir = self.store.scan_dir
+        paths = {
+            "report_json": os.path.join(scan_dir, "report.json"),
+            "findings_json": os.path.join(scan_dir, "findings.json"),
+            "inventory_json": os.path.join(scan_dir, "asset_inventory.json"),
+            "manifest_json": os.path.join(scan_dir, "manifest.json"),
+            "report_txt": os.path.join(scan_dir, "report.txt"),
+            "report_csv": os.path.join(scan_dir, "report.csv"),
+            "report_html": os.path.join(scan_dir, "report.html"),
+        }
+
+        summary_meta = {
+            "scan_id": self.store.scan_id,
+            "target": self.store.target,
+            "profile": self.store.profile_name,
+            "speed": self.store.speed_name,
+            "start_time": self.store.start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "end_time": self.store.end_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "duration_seconds": round((self.store.end_time - self.store.start_time).total_seconds(), 2),
+            "status": self.store.status,
+            "active_tests_authorized": self.store.active_tests_authorized,
+            "total_live_hosts": len(self.store.assets),
+            "total_findings": len(self.store.findings),
+            "total_errors": len(self.store.errors)
+        }
+
+        # 1. Birleşik report.json
+        unified_report = {
+            "scan_info": summary_meta,
+            "environment": self.store.environment_info,
+            "assets": self.store.assets,
+            "findings": self.store.findings,
+            "tasks": self.store.tasks,
+            "errors": self.store.errors
+        }
+        self._write_json(paths["report_json"], unified_report)
+
+        # 2. findings.json
+        self._write_json(paths["findings_json"], {
+            "scan_id": self.store.scan_id,
+            "total_findings": len(self.store.findings),
+            "findings": self.store.findings
+        })
+
+        # 3. asset_inventory.json
+        self._write_json(paths["inventory_json"], {
+            "scan_id": self.store.scan_id,
+            "total_assets": len(self.store.assets),
+            "assets": list(self.store.assets.values())
+        })
+
+        # 4. manifest.json
+        self._write_json(paths["manifest_json"], {
+            "scan_info": summary_meta,
+            "tools": self.store.environment_info.get("tools", {}),
+            "tasks": self.store.tasks,
+            "errors": self.store.errors
+        })
+
+        # 5. report.csv
+        self._write_csv(paths["report_csv"])
+
+        # 6. report.txt
+        self._write_txt(paths["report_txt"], summary_meta)
+
+        # 7. report.html (HTML-Escape Korumalı)
+        self._write_html(paths["report_html"], summary_meta)
+
+        print(f"\n{Colors.GREEN}{Colors.BOLD}[✓] MERKEZİ PROJE VE RAPOR PAKETİ KAYDEDİLDİ:{Colors.ENDC}")
+        print(f"    📂 Proje Klasörü : {Colors.BOLD}{scan_dir}{Colors.ENDC}")
+        print(f"    ├── Birleşik JSON: {paths['report_json']}")
+        print(f"    ├── HTML Raporu  : {paths['report_html']}")
+        print(f"    ├── TXT Raporu   : {paths['report_txt']}")
+        print(f"    ├── CSV Envanter : {paths['report_csv']}")
+        print(f"    ├── Bulgular     : {paths['findings_json']}")
+        print(f"    ├── Varlıklar    : {paths['inventory_json']}")
+        print(f"    └── Manifest/Log : {paths['manifest_json']}")
+
+    def _write_json(self, path: str, data: Any):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            self.logger.error(f"JSON yazma hatası ({path}): {exc}")
+
+    def _write_csv(self, path: str):
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "IP", "Hostname", "MAC", "Vendor", "OS", "Port", "Protocol",
+                    "State", "Service", "Product", "Version", "Sources"
+                ])
+                for ip, asset in self.store.assets.items():
+                    os_top = asset["os_matches"][0]["name"] if asset["os_matches"] else "Bilinmiyor"
+                    if not asset["ports"]:
+                        writer.writerow([
+                            ip, asset["hostname"], asset["mac"], asset["vendor"],
+                            os_top, "-", "-", "up", "-", "-", "-", ",".join(asset["discovery_sources"])
+                        ])
+                    else:
+                        for p in asset["ports"]:
+                            writer.writerow([
+                                ip, asset["hostname"], asset["mac"], asset["vendor"],
+                                os_top, p["port"], p["protocol"], p["state"],
+                                p["service"], p["product"], p["version"], ",".join(p.get("sources", []))
+                            ])
+        except Exception as exc:
+            self.logger.error(f"CSV yazma hatası ({path}): {exc}")
+
+    def _write_txt(self, path: str, meta: Dict[str, Any]):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("=" * 78 + "\n")
+                f.write("DEEPNETMAPPER PRO - BİRLEŞİK AĞ KEŞİF VE GÜVENLİK DENETİM RAPORU\n")
+                f.write("=" * 78 + "\n")
+                f.write(f"Tarama Kimliği : {meta['scan_id']}\n")
+                f.write(f"Hedef Kapsamı  : {meta['target']}\n")
+                f.write(f"Profil / Hız   : {meta['profile']} | {meta['speed']}\n")
+                f.write(f"Başlangıç/Bitiş: {meta['start_time']} -> {meta['end_time']} ({meta['duration_seconds']} sn)\n")
+                f.write(f"Tarama Durumu  : {meta['status']}\n")
+                f.write(f"Aktif Cihazlar : {meta['total_live_hosts']} | Bulgular: {meta['total_findings']}\n")
+                f.write("=" * 78 + "\n\n")
+
+                for ip, data in self.store.assets.items():
+                    f.write(f"[CİHAZ] {data['ip']} ({data['hostname']})\n")
+                    f.write(f"  MAC / Üretici  : {data['mac']} ({data['vendor']})\n")
+                    f.write(f"  Keşif Kaynağı  : {', '.join(data['discovery_sources'])}\n")
+                    if data["os_matches"]:
+                        os_str = ", ".join(f"{o['name']} (%{o['accuracy']})" for o in data["os_matches"][:3])
+                        f.write(f"  OS Tahminleri  : {os_str}\n")
+                    if data["ports"]:
+                        f.write("  Açık Portlar   :\n")
+                        for p in data["ports"]:
+                            svc = f"{p['service']} {p['product']} {p['version']} {p['extrainfo']}".strip()
+                            f.write(f"    - {p['port']}/{p['protocol']:<5} {p['state']:<8} {svc}\n")
+                    f.write("\n" + "-" * 60 + "\n")
+
+                if self.store.findings:
+                    f.write("\n" + "=" * 78 + "\n")
+                    f.write("GÜVENLİK VE YAPILANDIRMA BULGULARI\n")
+                    f.write("=" * 78 + "\n")
+                    for fn in self.store.findings:
+                        port_info = f":{fn['port']}" if fn["port"] else ""
+                        f.write(f"[{fn['severity']}] {fn['id']} - {fn['title']} ({fn['asset_ip']}{port_info})\n")
+                        f.write(f"  Kategori : {fn['category']} | Araç: {fn['tool']}\n")
+                        f.write(f"  Kanıt    : {fn['evidence']}\n")
+                        f.write(f"  Öneri    : {fn['remediation']}\n\n")
+        except Exception as exc:
+            self.logger.error(f"TXT yazma hatası ({path}): {exc}")
+
+    def _write_html(self, path: str, meta: Dict[str, Any]):
+        """Tüm dinamik içerikleri html.escape() işleminden geçirerek güvenli HTML üretir."""
+        e = html.escape
+        try:
+            parts: List[str] = [f"""<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <title>DeepNetMapper Pro Raporu - {e(str(meta['scan_id']))}</title>
+    <style>
+        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #0f172a; color: #e2e8f0; margin: 24px; }}
+        h1, h2, h3 {{ color: #38bdf8; margin-top: 0; }}
+        .meta-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 24px; }}
+        .card {{ background: #1e293b; border: 1px solid #334155; padding: 18px; border-radius: 8px; margin-bottom: 18px; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.92rem; }}
+        th, td {{ border: 1px solid #334155; padding: 8px 10px; text-align: left; vertical-axis: top; }}
+        th {{ background: #0284c7; color: #fff; }}
+        .badge {{ display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 0.8rem; font-weight: bold; }}
+        .sev-CRITICAL, .sev-HIGH {{ background: #dc2626; color: #fff; }}
+        .sev-MEDIUM {{ background: #d97706; color: #fff; }}
+        .sev-LOW {{ background: #2563eb; color: #fff; }}
+        .sev-INFO {{ background: #475569; color: #fff; }}
+        pre {{ background: #0f172a; padding: 8px; border-radius: 4px; overflow-x: auto; font-size: 0.82rem; color: #94a3b8; margin: 4px 0; }}
+    </style>
+</head>
+<body>
+    <h1>DeepNetMapper Pro - Birleşik Denetim Raporu</h1>
+    <div class="meta-grid">
+        <div class="card"><strong>Tarama ID:</strong><br>{e(str(meta['scan_id']))}</div>
+        <div class="card"><strong>Hedef Kapsamı:</strong><br>{e(str(meta['target']))}</div>
+        <div class="card"><strong>Durum:</strong><br>{e(str(meta['status']))}</div>
+        <div class="card"><strong>Canlı Cihaz / Bulgu:</strong><br>{meta['total_live_hosts']} Cihaz / {meta['total_findings']} Bulgu</div>
+    </div>
+"""]
+
+            # Varlıklar
+            parts.append("<h2>1. Keşfedilen Varlıklar ve Açık Servisler</h2>")
+            for ip, data in self.store.assets.items():
+                os_text = ", ".join(f"{e(o['name'])} (%{e(str(o['accuracy']))})" for o in data["os_matches"][:3]) or "Tespit Edilemedi"
+                sources_text = ", ".join(e(s) for s in data["discovery_sources"])
+                parts.append(f"""
+    <div class="card">
+        <h3>{e(data['ip'])} <span class="badge sev-INFO">{e(data['hostname'])}</span></h3>
+        <p><strong>MAC / Üretici:</strong> {e(data['mac'])} ({e(data['vendor'])}) |
+           <strong>Kaynaklar:</strong> {sources_text} |
+           <strong>OS:</strong> {os_text}</p>
+""")
+                if data["ports"]:
+                    parts.append("<table><tr><th>Port/Protokol</th><th>Durum</th><th>Servis ve Sürüm</th><th>Kaynak</th></tr>")
+                    for p in data["ports"]:
+                        svc = f"{p['service']} {p['product']} {p['version']} {p['extrainfo']}".strip()
+                        p_src = ", ".join(p.get("sources", []))
+                        parts.append(
+                            f"<tr><td>{e(str(p['port']))}/{e(p['protocol'])}</td>"
+                            f"<td>{e(p['state'])}</td>"
+                            f"<td>{e(svc)}</td>"
+                            f"<td>{e(p_src)}</td></tr>"
+                        )
+                    parts.append("</table>")
+                else:
+                    parts.append("<p><em>Açık port tespit edilmedi veya yalnızca keşif profili çalıştırıldı.</em></p>")
+                parts.append("</div>")
+
+            # Güvenlik Bulguları
+            parts.append("<h2>2. Güvenlik ve Yapılandırma Bulguları</h2>")
+            if self.store.findings:
+                parts.append("<table><tr><th>Önem</th><th>Varlık</th><th>Başlık & Kategori</th><th>Kanıt</th><th>Düzeltme Önerisi</th></tr>")
+                for fn in self.store.findings:
+                    sev = e(fn["severity"])
+                    loc = f"{e(fn['asset_ip'])}" + (f":{e(str(fn['port']))}" if fn["port"] else "")
+                    parts.append(
+                        f"<tr>"
+                        f"<td><span class='badge sev-{sev}'>{sev}</span></td>"
+                        f"<td>{loc}</td>"
+                        f"<td><strong>{e(fn['title'])}</strong><br><small>{e(fn['category'])} ({e(fn['tool'])})</small></td>"
+                        f"<td><pre>{e(fn['evidence'])}</pre></td>"
+                        f"<td>{e(fn['remediation'])}</td>"
+                        f"</tr>"
+                    )
+                parts.append("</table>")
+            else:
+                parts.append("<div class='card'><p>Herhangi bir güvenlik bulgusu kaydedilmedi.</p></div>")
+
+            # Görev ve Araç Kayıtları
+            parts.append("<h2>3. Çalıştırılan Görevler ve Ham Çıktı Yolları</h2>")
+            parts.append("<table><tr><th>Modül</th><th>Araç</th><th>Durum</th><th>Çıkış Kodu</th><th>Süre (sn)</th><th>Ham Çıktı</th></tr>")
+            for t in self.store.tasks:
+                parts.append(
+                    f"<tr><td>{e(t['module'])}</td><td>{e(t['tool'])}</td><td>{e(t['status'])}</td>"
+                    f"<td>{e(str(t['returncode']))}</td><td>{e(str(t['duration_sec']))}</td>"
+                    f"<td>{e(str(t['raw_file'] or '-'))}</td></tr>"
+                )
+            parts.append("</table></body></html>")
+
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(parts))
+        except Exception as exc:
+            self.logger.error(f"HTML yazma hatası ({path}): {exc}")
+
+
+# =====================================================================
+# 7. ANA ORKESTRASYON SINIFI: DeepNetMapperPro (deepnetmapper.py)
+# =====================================================================
+class DeepNetMapperPro:
+    """DeepNetMapper Pro CLI, İnteraktif Menü, Profil ve Modül Orkestratörü."""
+
+    SCAN_PROFILES = {
+        "1": {
+            "name": "Profil 1 - Hızlı Keşif (Canlı Cihazlar, MAC, DNS, Temel Topoloji - Portsuz)",
+            "nmap_flags": ["-sn", "-PE", "-PP", "-PM", "--traceroute"],
+            "run_dns": True,
+            "run_web": False,
+            "run_tls": False,
+            "run_vuln": False,
+            "requires_active_auth": False
+        },
+        "2": {
+            "name": "Profil 2 - Standart Denetim (Yaygın TCP Portları, Servis/Sürüm, OS, Güvenli NSE)",
+            "nmap_flags": ["-sS", "-sV", "-O", "--script=default,safe", "--traceroute"],
+            "run_dns": True,
+            "run_web": True,
+            "run_tls": True,
+            "run_vuln": True,
+            "requires_active_auth": False
+        },
+        "3": {
+            "name": "Profil 3 - Derin Denetim (Tüm 65535 TCP Portu, Servis, OS ve Ayrıntılı Haritalama)",
+            "nmap_flags": ["-sS", "-p-", "-sV", "-O", "--script=default", "--traceroute"],
+            "run_dns": True,
+            "run_web": True,
+            "run_tls": True,
+            "run_vuln": True,
+            "requires_active_auth": False
+        },
+        "4": {
+            "name": "Profil 4 - Güvenlik Denetimi (Seçilmiş NSE Vuln Kontrolleri, TLS, Web ve Zafiyet Göstergeleri)",
+            "nmap_flags": ["-sS", "-sV", "-O", "--script=vuln,safe,discovery", "--traceroute"],
+            "run_dns": True,
+            "run_web": True,
+            "run_tls": True,
+            "run_vuln": True,
+            "requires_active_auth": True
+        },
+        "5": {
+            "name": "Profil 5 - Özel Profil (Port Aralığı, Zaman Aşımı, Hız ve Araç Seçimi)",
+            "nmap_flags": ["-sS", "-sV"],
+            "run_dns": True,
+            "run_web": True,
+            "run_tls": True,
+            "run_vuln": True,
+            "requires_active_auth": False
+        }
+    }
+
+    SPEED_PROFILES = {
+        "1": {"name": "Yavaş (T2 - Düşük Ağ Yükü / Nazik)", "flags": ["-T2"]},
+        "2": {"name": "Dengeli (T3 - Standart Önerilen Hız)", "flags": ["-T3"]},
+        "3": {"name": "Hızlı (T4 - Agresif ve Hızlı)", "flags": ["-T4", "--min-rate", "300"]},
+        "4": {"name": "Özel Hız (Kullanıcı Tanımlı Paket Oranı ve Zaman Aşımı)", "flags": ["-T4"]}
+    }
+
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.target: Optional[str] = args.target
+        self.profile_choice: Optional[str] = args.profile
+        self.speed_choice: Optional[str] = args.speed
+        self.base_scans_dir: str = args.output
+        self.allow_active: bool = args.allow_active
+        self.host_timeout_sec: int = args.timeout
+
+        # Geçici konsol loglayıcı (ResultStore açılınca dosya handler eklenir)
+        self.logger = logging.getLogger("DeepNetMapperPro")
+        self.logger.setLevel(logging.DEBUG)
+        self.store: Optional[ResultStore] = None
+        self.proc_mgr: Optional[ProcessManager] = None
+        self.tool_mgr = ToolManager(self.logger)
+        self.nmap_mod: Optional[NmapScannerModule] = None
+        self.report_engine: Optional[ReportEngine] = None
+
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def print_banner(self):
+        print(f"""{Colors.CYAN}{Colors.BOLD}
+================================================================================
+   ____                 _   _      _   __  __                             ____  
+  |  _ \\  ___  ___ _ __| \\ | | ___| |_|  \\/  | __ _ _ __  _ __   ___ _ _|  _ \\ 
+  | | | |/ _ \\/ _ \\ '_ \\  \\| |/ _ \\ __| |\\/| |/ _` | '_ \\| '_ \\ / _ \\ '__| |_) |
+  | |_| |  __/  __/ |_) | |\\  |  __/ |_| |  | | (_| | |_) | |_) |  __/ |  |  __/ 
+  |____/ \\___|\\___| .__/|_| \\_|\\___|\\__|_|  |_|\\__,_| .__/| .__/ \\___|_|  |_|    
+                  |_|                               |_|   |_|             PRO
+         Kali Linux Modüler Ağ Keşif, Servis Analizi ve Denetim Çatısı
+================================================================================{Colors.ENDC}""")
+
+    def _setup_file_logger(self):
+        if not self.store:
+            return
+        log_file = os.path.join(self.store.logs_dir, "scan.log")
+        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        self.logger.addHandler(fh)
+
+    def _signal_handler(self, signum, frame):
+        """Ctrl+C veya SIGTERM geldiğinde aktif süreci durdurur, XML verilerini kurtarır ve KISMİ rapor üretir."""
+        if self.proc_mgr and self.proc_mgr.is_interrupted:
+            return
+        print(f"\n\n{Colors.WARNING}{Colors.BOLD}[!] KESİNTİ SİNYALİ ALINDI (Ctrl+C)!{Colors.ENDC}")
+        print(f"{Colors.CYAN}[*] Aktif alt süreç sonlandırılıyor ve kısmi sonuçlar kurtarılıyor...{Colors.ENDC}")
+
+        if self.proc_mgr:
+            self.proc_mgr.is_interrupted = True
+            self.proc_mgr.terminate_active_process()
+
+        if self.nmap_mod:
+            self.nmap_mod.recover_all_pending_xmls()
+
+        if self.report_engine:
+            self.report_engine.save_all(final_status="KESİLDİ (KISMİ SONUÇLAR)")
+
+        sys.exit(130)
+
+    def check_environment_and_tools(self):
+        if hasattr(os, "geteuid") and os.geteuid() != 0 and not self.args.unprivileged:
+            print(f"{Colors.FAIL}[!] HATA: SYN taraması (-sS), OS tespiti (-O) ve ARP keşfi için 'sudo' gereklidir.{Colors.ENDC}")
+            print(f"{Colors.WARNING}    Örnek: sudo python3 {sys.argv[0]} (veya yetkisiz mod için --unprivileged){Colors.ENDC}")
+            sys.exit(1)
+
+        inventory = self.tool_mgr.check_all_tools()
+        print(f"\n{Colors.BOLD}[*] Kali Araç Yöneticisi Denetimi:{Colors.ENDC}")
+        for name, info in inventory.items():
+            if info["installed"]:
+                print(f"    {Colors.GREEN}[✓] {name:<12}{Colors.ENDC} : {info['version']}")
+            else:
+                tag = "ZORUNLU" if info["required"] else "İsteğe Bağlı"
+                color = Colors.FAIL if info["required"] else Colors.WARNING
+                print(f"    {color}[!] {name:<12}{Colors.ENDC} : Kurulu Değil ({tag} - {info['description']})")
+
+        if not self.tool_mgr.is_available("nmap"):
+            print(f"\n{Colors.FAIL}[!] Kritik bağımlılık eksik: 'nmap' kurulu olmadan devam edilemez.{Colors.ENDC}")
+            sys.exit(1)
+
+    def interactive_setup(self):
+        """Eksik parametreleri kullanıcıdan doğrulanmış menü adımlarıyla alır."""
+        # 1. Hedef Seçimi ve Doğrulaması
+        while True:
+            if not self.target:
+                print(f"\n{Colors.BOLD}[1] Hedef Kapsam (Scope) Belirleme:{Colors.ENDC}")
+                print("    [A] Yerel Arayüz ve Alt Ağları Listele (Otomatik Keşif)")
+                print("    [B] Manuel IP, CIDR veya Alan Adı Gir (örn: 192.168.1.0/24)")
+                choice = input(f"{Colors.GREEN}>>> Seçiminiz (A/B, Varsayılan: A): {Colors.ENDC}").strip().upper()
+
+                if choice == "B":
+                    self.target = input(f"{Colors.GREEN}>>> Hedef IP / CIDR / Alan Adı: {Colors.ENDC}").strip()
+                else:
+                    self.target = self._select_from_local_environment()
+                    if not self.target:
+                        self.target = input(f"{Colors.GREEN}>>> Manuel Hedef IP / CIDR / Alan Adı: {Colors.ENDC}").strip()
+
+            valid, t_type, desc = ScopeValidator.validate_target(self.target)
+            if valid:
+                print(f"{Colors.GREEN}[✓] Hedef Doğrulandı: {self.target} -> {desc}{Colors.ENDC}")
+                break
+            else:
+                print(f"{Colors.FAIL}[!] Geçersiz Hedef: {desc}{Colors.ENDC}")
+                self.target = None
+
+        # 2. Profil Seçimi
+        if not self.profile_choice or self.profile_choice not in self.SCAN_PROFILES:
+            print(f"\n{Colors.BOLD}[2] Tarama Profili Seçin:{Colors.ENDC}")
+            for k, v in self.SCAN_PROFILES.items():
+                print(f"    [{k}] {v['name']}")
+            p_in = input(f"{Colors.GREEN}>>> Seçiminiz (1-5, Varsayılan: 2): {Colors.ENDC}").strip()
+            self.profile_choice = p_in if p_in in self.SCAN_PROFILES else "2"
+
+        # Özel Profil (Profil 5) yapılandırması
+        if self.profile_choice == "5":
+            self._configure_custom_profile()
+
+        # 3. Hız Seçimi
+        if not self.speed_choice or self.speed_choice not in self.SPEED_PROFILES:
+            print(f"\n{Colors.BOLD}[3] Tarama Hızı Seçin:{Colors.ENDC}")
+            for k, v in self.SPEED_PROFILES.items():
+                print(f"    [{k}] {v['name']}")
+            s_in = input(f"{Colors.GREEN}>>> Seçiminiz (1-4, Varsayılan: 2 - Dengeli): {Colors.ENDC}").strip()
+            self.speed_choice = s_in if s_in in self.SPEED_PROFILES else "2"
+
+        if self.speed_choice == "4":
+            min_rate = input(f"{Colors.GREEN}>>> Minimum Paket/Saniye (--min-rate, örn: 400): {Colors.ENDC}").strip()
+            if min_rate.isdigit() and int(min_rate) > 0:
+                self.SPEED_PROFILES["4"]["flags"].extend(["--min-rate", min_rate])
+
+        # 4. Aktif / Yoğun Test İzni Kontrolü
+        selected_profile = self.SCAN_PROFILES[self.profile_choice]
+        if selected_profile["requires_active_auth"] and not self.allow_active:
+            print(f"\n{Colors.WARNING}[!] Güvenlik Uyarısı: Seçilen profil aktif güvenlik/zafiyet kontrolleri (NSE vuln / Nikto) içerir.{Colors.ENDC}")
+            confirm = input(f"{Colors.GREEN}>>> '{self.target}' hedefinde aktif test 권한/izniniz var mı? (E/H, Varsayılan: H): {Colors.ENDC}").strip().upper()
+            self.allow_active = (confirm == "E")
+            if not self.allow_active:
+                print(f"{Colors.CYAN}[i] Aktif test izni onaylanmadı; yalnızca güvenli (safe/default) kontroller çalıştırılacak.{Colors.ENDC}")
+                self.SCAN_PROFILES["4"]["nmap_flags"] = ["-sS", "-sV", "-O", "--script=default,safe", "--traceroute"]
+
+    def _select_from_local_environment(self) -> Optional[str]:
+        """Yerel alt ağları listeler, Wi-Fi SSID'lerini bilgi olarak gösterir ama yalnızca geçerli alt ağları hedef yapar."""
+        subnets = []
+        try:
+            proc = subprocess.run(["ip", "-o", "-4", "addr", "show"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+            for line in proc.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 4 and parts[1] != "lo" and "/" in parts[3]:
+                    net = str(ipaddress.ip_network(parts[3], strict=False))
+                    subnets.append({"iface": parts[1], "ip": parts[3], "cidr": net})
+        except Exception:
+            pass
+
+        if not subnets:
+            print(f"{Colors.WARNING}[!] Aktif yerel alt ağ bulunamadı.{Colors.ENDC}")
+            return None
+
+        print(f"\n{Colors.GREEN}{Colors.BOLD}[+] Tespit Edilen Yerel Ağ Arayüzleri:{Colors.ENDC}")
+        for idx, item in enumerate(subnets, start=1):
+            print(f"    [{idx}] Arayüz: {Colors.BOLD}{item['iface']:<10}{Colors.ENDC} | Cihaz IP: {item['ip']:<18} | Hedef CIDR: {Colors.CYAN}{item['cidr']}{Colors.ENDC}")
+        print("    [0] Manuel Hedef Girmek İstiyorum")
+
+        sel = input(f"\n{Colors.GREEN}>>> Taranacak Alt Ağ Numarasını Seçin: {Colors.ENDC}").strip()
+        if sel.isdigit() and 1 <= int(sel) <= len(subnets):
+            return subnets[int(sel) - 1]["cidr"]
+        return None
+
+    def _configure_custom_profile(self):
+        ports = self.args.ports
+        if not ports:
+            ports = input(f"{Colors.GREEN}>>> Port Aralığı (örn: 22,80,443,1000-2000 veya tümü için -p-): {Colors.ENDC}").strip()
+        if ports == "-p-":
+            self.SCAN_PROFILES["5"]["nmap_flags"].append("-p-")
+        elif ScopeValidator.validate_port_spec(ports):
+            self.SCAN_PROFILES["5"]["nmap_flags"].extend(["-p", ports])
+        else:
+            print(f"{Colors.WARNING}[i] Geçersiz veya boş port aralığı; varsayılan yaygın portlar taranacak.{Colors.ENDC}")
+
+    def run(self):
+        self.print_banner()
+        self.check_environment_and_tools()
+        self.interactive_setup()
+
+        profile = self.SCAN_PROFILES[self.profile_choice]
+        speed = self.SPEED_PROFILES[self.speed_choice]
+
+        # Merkezi veri deposu ve süreç yöneticisini başlat
+        self.store = ResultStore(
+            base_scans_dir=self.base_scans_dir,
+            target=self.target,
+            profile_name=profile["name"],
+            speed_name=speed["name"]
+        )
+        self.store.active_tests_authorized = self.allow_active
+        self.store.environment_info["tools"] = self.tool_mgr.inventory
+        self._setup_file_logger()
+
+        self.proc_mgr = ProcessManager(self.store, self.logger)
+        self.report_engine = ReportEngine(self.store, self.logger)
+
+        # Modülleri hazırla
+        discovery_mod = DiscoveryModule(self.store, self.proc_mgr, self.tool_mgr, self.logger)
+        self.nmap_mod = NmapScannerModule(self.store, self.proc_mgr, self.tool_mgr, self.logger)
+        dns_mod = DnsAuditModule(self.store, self.proc_mgr, self.tool_mgr, self.logger)
+        web_mod = WebAuditModule(self.store, self.proc_mgr, self.tool_mgr, self.logger)
+        tls_mod = TlsAuditModule(self.store, self.proc_mgr, self.tool_mgr, self.logger)
+        vuln_mod = VulnerabilityAuditModule(self.store, self.tool_mgr, self.logger)
+
+        print(f"\n{Colors.CYAN}{Colors.BOLD}[AŞAMA 1] Ortam Analizi ve Canlı Cihaz Keşfi Başlatılıyor...{Colors.ENDC}")
+        discovery_mod.inspect_local_environment()
+        discovery_mod.run_arp_scan(self.target)
+        live_ips = self.nmap_mod.discover_live_hosts(self.target)
+
+        if not live_ips:
+            print(f"{Colors.WARNING}[!] Hedef kapsamda ({self.target}) aktif cihaz bulunamadı.{Colors.ENDC}")
+            self.report_engine.save_all(final_status="AKTİF CİHAZ BULUNAMADI")
+            return
+
+        print(f"{Colors.GREEN}[+] Toplam {len(live_ips)} aktif cihaz tespit edildi:{Colors.ENDC}")
+        for ip in live_ips:
+            asset = self.store.ensure_asset(ip)
+            mac_str = f" [{asset['mac']} - {asset['vendor']}]" if asset["mac"] != "Bilinmiyor" else ""
+            print(f"    └── {Colors.BOLD}{ip}{Colors.ENDC}{mac_str}")
+
+        # Aşama 2: Nmap Profil Taraması
+        self.nmap_mod.scan_hosts(
+            live_ips=live_ips,
+            profile_flags=profile["nmap_flags"],
+            speed_flags=speed["flags"],
+            host_timeout_sec=self.host_timeout_sec
+        )
+
+        # Aşama 3: Ek Denetim Modülleri (DNS, Web, TLS, Zafiyet Korelasyonu)
+        if profile["run_dns"] and not self.proc_mgr.is_interrupted:
+            dns_mod.run(self.target, live_ips)
+
+        if profile["run_web"] and not self.proc_mgr.is_interrupted:
+            web_mod.run(live_ips, run_nikto=(self.profile_choice == "4" and self.allow_active))
+
+        if profile["run_tls"] and not self.proc_mgr.is_interrupted:
+            tls_mod.run(live_ips)
+
+        if profile["run_vuln"] and not self.proc_mgr.is_interrupted:
+            vuln_mod.run(live_ips)
+
+        # Sonuç durumunu belirle ve kaydet
+        has_failed_tasks = any(t["status"] in ("FAILED", "TIMEOUT") for t in self.store.tasks)
+        final_status = "KISMİ TAMAMLANDI (BAZI GÖREVLERDE HATA/ZAMAN AŞIMI)" if has_failed_tasks else "TAMAMLANDI"
+        self.report_engine.save_all(final_status=final_status)
+
+
+def initialize_project_structure(base_dir: str = "DeepNetMapper-Pro"):
+    """Hedef mimarideki klasör ve yapılandırma dosyalarını (config/, core/, modules/, scans/) oluşturur."""
+    dirs = [
+        os.path.join(base_dir, "config"),
+        os.path.join(base_dir, "core"),
+        os.path.join(base_dir, "modules"),
+        os.path.join(base_dir, "scans")
+    ]
+    for d in dirs:
+        os.makedirs(d, exist_ok=True)
+
+    settings_path = os.path.join(base_dir, "config", "settings.json")
+    if not os.path.exists(settings_path):
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "default_output_dir": "scans",
+                "default_host_timeout_sec": 600,
+                "require_root_by_default": True,
+                "safe_defaults": {"allow_active_tests": False}
+            }, f, indent=2, ensure_ascii=False)
+
+    profiles_path = os.path.join(base_dir, "config", "profiles.json")
+    if not os.path.exists(profiles_path):
+        with open(profiles_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "scan_profiles": DeepNetMapperPro.SCAN_PROFILES,
+                "speed_profiles": DeepNetMapperPro.SPEED_PROFILES
+            }, f, indent=2, ensure_ascii=False)
+
+    print(f"{Colors.GREEN}[✓] '{base_dir}/' proje dizin yapısı ve config dosyaları oluşturuldu.{Colors.ENDC}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="DeepNetMapper Pro - Kali Linux Modüler Ağ Keşif ve Güvenlik Denetim Aracı"
+    )
+    parser.add_argument("-t", "--target", help="Hedef IP, CIDR, IP Aralığı veya Alan Adı (örn: 192.168.1.0/24)")
+    parser.add_argument("-p", "--profile", choices=["1", "2", "3", "4", "5"], help="Tarama Profili (1-5)")
+    parser.add_argument("-s", "--speed", choices=["1", "2", "3", "4"], help="Hız Profili (1: Yavaş, 2: Dengeli, 3: Hızlı, 4: Özel)")
+    parser.add_argument("--ports", help="Özel profil (Profil 5) için port aralığı (örn: 22,80,443,1000-2000)")
+    parser.add_argument("--timeout", type=int, default=600, help="Cihaz başı maksimum tarama süresi (saniye, varsayılan: 600)")
+    parser.add_argument("--allow-active", action="store_true", help="Yetkilendirilmiş hedeflerde aktif NSE vuln ve Nikto testlerine izin ver")
+    parser.add_argument("--unprivileged", action="store_true", help="Root yetkisi olmadan TCP Connect (-sT) modunda çalıştır")
+    parser.add_argument("-o", "--output", default="scans", help="Taramaların kaydedileceği ana klasör (varsayılan: scans)")
+    parser.add_argument("--init-project", action="store_true", help="DeepNetMapper-Pro klasör ve config iskeletini oluştur ve çık")
+
+    cli_args = parser.parse_args()
+
+    if cli_args.init_project:
+        initialize_project_structure()
+        sys.exit(0)
+
+    app = DeepNetMapperPro(cli_args)
+    app.run()
