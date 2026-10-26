@@ -7,5 +7,5 @@ This application relies entirely on Python's built-in standard library. No exter
 You can execute and run the application directly in your Linux terminal with the following command:
 
 ```bash
-python3 applacitonNAme.py
+python3 deepmappro.py
 ```
